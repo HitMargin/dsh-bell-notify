@@ -1,0 +1,497 @@
+/**
+ * dsh-bell-notify — 宿主半边。
+ *
+ * 职责四件：
+ *
+ * 1. **观察"跑完了"**：监听 `api-session/status(sessionId, running)`，只在
+ *    `running: true → false` 这一次跳变上记一笔。要求先见过 `true`，是为了
+ *    避免启动时把"本来就是空闲"的会话误报成刚跑完。
+ * 2. **发 Windows 原生通知**：优先 Electron 的 `Notification`（走 DSH 自己的
+ *    应用身份，托盘里显示的是 DSH 而不是 PowerShell）；Electron 不可用时
+ *    回退到 WinRT toast。两种方式都是**操作系统通知**，出现在 Windows
+ *    通知中心，而不是网页里的一个气泡。
+ * 3. **推给浏览器**：通过 SSE 把事件推给页面，让铃铛能显示红点、并在通知
+ *    真的发不出去时由客户端兜底。用 SSE 而不是轮询，是因为窗口最小化时
+ *    Chromium 会把 `setInterval` 降频（后台 5 分钟后最慢到 1 次/分钟），
+ *    而人恰恰是在离开窗口时才需要通知。
+ * 4. **存开关**：`enabled` 决定要不要记录与通知。
+ *
+ * 刻意的取舍：
+ * - **通知失败要留痕**。每条事件带 `delivered` 字段，null 表示系统通知没发
+ *   出去；客户端据此决定是否兜底弹网页通知。绝不静默吞掉。
+ * - **不持久化 enabled**。页面加载时客户端会把自己记的值 PUT 回来，宿主以
+ *    客户端为准。省掉一份状态文件，也不会出现"宿主观点的开关和界面不一致"。
+ * - **缓冲区有上限**。SSE 断线期间的补偿靠客户端按 `since` 拉取，但补不了
+ *   无限久 —— 超过 20 条就丢最旧的，通知本来也不该补发昨天的。
+ *
+ * @module dsh-bell-notify
+ */
+
+import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
+
+/** 开关与补偿拉取。 */
+const ROUTE_STATE = '/plugins/dsh-bell/state'
+const ROUTE_PENDING = '/plugins/dsh-bell/pending'
+/** SSE 长连接。 */
+const ROUTE_STREAM = '/plugins/dsh-bell/stream'
+/** 手动发一条测试通知，用来验证系统通知能不能弹出来。 */
+const ROUTE_TEST = '/plugins/dsh-bell/test'
+
+/** 未读事件缓冲区上限。 */
+const MAX_PENDING = 20
+/** 心跳间隔：让中间的代理和 Chromium 都别把连接当死的关掉。 */
+const HEARTBEAT_MS = 25000
+/** 请求体上限。 */
+const MAX_BODY_BYTES = 16 * 1024
+/**
+ * PowerShell toast 的硬上限。它要起一个进程（PowerShell 5.1 冷启动可能一两秒），
+ * 卡住了不能一直挂着 —— 但因为它跑在后台、事件已经先推走了，这个超时只影响
+ * delivered 字段什么时候回填，不影响用户看到通知的速度。
+ */
+const TOAST_TIMEOUT_MS = 8000
+/**
+ * toast 用的 AppID，按优先级排列。
+ *
+ * AppID 决定通知顶部显示的名字与图标 —— 用 PowerShell 的 AppID，Windows 就会把
+ * 通知归到"Windows PowerShell"名下。所以优先用 DSH 自己的身份。
+ */
+const TOAST_APP_ID_DSH = 'electron.app.DeepSeek Harness'
+/**
+ * Windows PowerShell 5.1 自带的已注册 AppID。
+ *
+ * 兜底用：它一定存在，所以即使 DSH 换了 AppID 也还有一条路。代价是通知会显示
+ * 成 PowerShell。
+ */
+const TOAST_APP_ID_FALLBACK = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+
+/**
+ * 插件入口。
+ *
+ * @param {object} ctx cordis 上下文。
+ */
+export function apply(ctx) {
+  const note = (message) => {
+    try {
+      if (typeof ctx.logger === 'function') ctx.logger('dsh-bell-notify').info(message)
+    } catch {
+      /* 日志打不出去不是功能故障 */
+    }
+  }
+
+  /** @param {(fn: Function, label: string) => void} mount */
+  const mount = (fn, label) => ctx.effect(fn, label)
+
+  /** 开关。默认关 —— 通知这种东西，默认不打扰。 */
+  let enabled = false
+  /** 单调递增的事件序号，客户端拿它做"从哪继续"。 */
+  let seq = 0
+  /** 未读事件（按 seq 升序）。 */
+  const pending = []
+  /** 正在跑的会话集合。 */
+  const running = new Set()
+  /** sessionId → 会话标题，来自 api-session/added。 */
+  const titles = new Map()
+  /** 连着的事件流响应。 */
+  const streams = new Set()
+
+  /* ─────────────────── 1. 发 Windows 通知 ─────────────────── */
+
+  /**
+   * 走 Electron 原生 Notification。
+   *
+   * 桌面版里宿主跑在 Electron 主进程，`require('electron')` 能拿到 Notification，
+   * 弹出来的是带 DSH 应用身份的系统通知 —— 这是最理想的一条路。
+   * 纯 `dsh web` 下没有 Electron，这里会抛 MODULE_NOT_FOUND，交给下一层。
+   *
+   * @param {string} title 标题。
+   * @param {string} body 正文。
+   * @returns {boolean} 是否成功。
+   */
+  const notifyElectron = (title, body) => {
+    try {
+      const require = createRequire(import.meta.url)
+      const electron = require('electron')
+      const Native = electron && electron.Notification
+      if (!Native) return false
+      if (typeof Native.isSupported === 'function' && !Native.isSupported()) return false
+      const instance = new Native({ title, body, silent: false })
+      if (typeof instance.show === 'function') instance.show()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 走 Windows 的 WinRT toast（PowerShell 5.1）。
+   *
+   * 这是没有任何依赖的兜底：WinRT 类型程序集在 Win10/11 自带，PowerShell 5.1
+   * 的 AppID 又是系统预注册的，所以不用自己写注册表。
+   *
+   * 正文通过环境变量传，避免把用户内容拼进命令行 —— 既躲开了引号地狱，
+   * 也堵住了命令注入。XML 转义在 PowerShell 里做。
+   *
+   * @param {string} title 标题。
+   * @param {string} body 正文。
+   * @returns {Promise<boolean>} 是否成功。
+   */
+  const notifyPowerShell = (title, body) => new Promise((resolve) => {
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+
+    const script = [
+      // WinRT 类型必须按命名空间逐个显式加载。只加载 ToastNotificationManager
+      // 是不够的 —— 后面 new XmlDocument 会报 "Cannot find type"。
+      '[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null',
+      '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null',
+      '$t = [System.Security.SecurityElement]::Escape($env:DSH_BELL_TITLE)',
+      '$b = [System.Security.SecurityElement]::Escape($env:DSH_BELL_BODY)',
+      '$x = New-Object Windows.Data.Xml.Dom.XmlDocument',
+      "$x.LoadXml(\"<toast><visual><binding template='ToastGeneric'><text>$t</text><text>$b</text></binding></visual></toast>\")",
+      '$o = New-Object Windows.UI.Notifications.ToastNotification($x)',
+      // 逐个 AppID 试：DSH 的身份优先，失败就退回 PowerShell 的（一定能用）。
+      '$ok = $false',
+      `foreach ($id in @('${TOAST_APP_ID_DSH}','${TOAST_APP_ID_FALLBACK}')) {`,
+      '  try {',
+      '    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($id).Show($o)',
+      '    $ok = $true; break',
+      '  } catch { }',
+      '}',
+      'if (-not $ok) { exit 1 }',
+    ].join('; ')
+
+    try {
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        env: { ...process.env, DSH_BELL_TITLE: title, DSH_BELL_BODY: body },
+        windowsHide: true,
+        stdio: 'ignore',
+      })
+      const timer = setTimeout(() => {
+        try {
+          child.kill()
+        } catch {
+          /* 已经退了 */
+        }
+        finish(false)
+      }, TOAST_TIMEOUT_MS)
+      if (typeof timer.unref === 'function') timer.unref()
+
+      child.on('error', () => {
+        clearTimeout(timer)
+        finish(false)
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        finish(code === 0)
+      })
+    } catch {
+      finish(false)
+    }
+  })
+
+  /**
+   * 发一条系统通知，返回实际走通的方式。
+   *
+   * `DSH_BELL_DISABLE_TOAST=1` 时直接跳过。两个用处：无头服务器上本就不该
+   * 弹通知；以及让自动化测试不必每跑一次就放六七条 toast 出来。
+   *
+   * @param {string} title 标题。
+   * @param {string} body 正文。
+   * @returns {Promise<string|null>} 'electron' | 'powershell' | 'skipped' | null（都失败）。
+   */
+  const deliver = async (title, body) => {
+    if (process.env.DSH_BELL_DISABLE_TOAST === '1') return 'skipped'
+    if (notifyElectron(title, body)) return 'electron'
+    if (process.platform === 'win32' && await notifyPowerShell(title, body)) return 'powershell'
+    return null
+  }
+
+  /* ─────────────────── 2. 观察会话状态 ─────────────────────── */
+
+  /** 把一条事件推给所有连着的页面。不传就推最后一条。 */
+  const broadcast = (event) => {
+    const payload = event || pending[pending.length - 1]
+    if (!payload) return
+    const frame = `data: ${JSON.stringify(payload)}\n\n`
+    for (const res of streams) {
+      try {
+        res.write(frame)
+      } catch {
+        streams.delete(res)
+      }
+    }
+  }
+
+  mount(() => {
+    const offStatus = ctx.on('api-session/status', (sessionId, isRunning) => {
+      if (isRunning) {
+        running.add(sessionId)
+        return
+      }
+      // 只有"刚才确实在跑"才算跑完。启动时那批 running=false 不会误报。
+      if (!running.delete(sessionId)) return
+      if (!enabled) return
+
+      seq += 1
+      const event = {
+        seq,
+        sessionId,
+        title: titles.get(sessionId) || '',
+        // 先标 pending 就推：客户端立刻能亮红点，不必等系统通知发完。
+        // PowerShell 兜底最坏要 4 秒，把它挡在事件前面会让提示明显迟滞。
+        delivered: 'pending',
+      }
+      pending.push(event)
+      while (pending.length > MAX_PENDING) pending.shift()
+      broadcast(event)
+
+      // 通知在后台发，结果补进同一条事件再推一次。
+      // 客户端按 seq 认更新，所以同一 seq 出现两次是设计内的。
+      void deliver(TITLE_DEFAULT, event.title || BODY_FALLBACK)
+        .then((how) => {
+          event.delivered = how || 'failed'
+          broadcast(event)
+          if (!how) note(`toast failed for ${sessionId}`)
+        })
+        .catch(() => {
+          event.delivered = 'failed'
+          broadcast(event)
+        })
+    })
+
+    // 标题缓存。拿不到就退回固定文案，不影响通知本身。
+    const offAdded = ctx.on('api-session/added', (summary) => {
+      if (!summary || typeof summary !== 'object') return
+      const id = summary.id ?? summary.sessionId
+      if (typeof id !== 'string' || id.length === 0) return
+      if (typeof summary.title === 'string' && summary.title.length > 0) {
+        titles.set(id, summary.title)
+      }
+    })
+
+    return () => {
+      offStatus()
+      offAdded()
+    }
+  }, 'dsh-bell-notify: session watchers')
+
+  /* ─────────────────────── 3. 路由 ─────────────────────── */
+
+  /** 只接受同源发起的写请求。 */
+  const isTrustedWrite = (req) => {
+    const site = String((req.headers && req.headers['sec-fetch-site']) || '').toLowerCase()
+    if (site === 'cross-site') return false
+    const method = String(req.method || 'GET').toUpperCase()
+    if (method === 'GET' || method === 'HEAD') return true
+    const origin = String((req.headers && req.headers.origin) || '')
+    if (origin.length === 0) return true
+    try {
+      const host = String((req.headers && req.headers.host) || '')
+      return new URL(origin).host === host
+    } catch {
+      return false
+    }
+  }
+
+  /** 用原生 req/res 读 JSON 请求体（不引入任何依赖）。 */
+  const readJsonBody = (req) => new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('请求体过大'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('error', reject)
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8').trim()
+      if (raw.length === 0) {
+        resolve({})
+        return
+      }
+      try {
+        resolve(JSON.parse(raw))
+      } catch (error) {
+        reject(new Error(`请求体不是合法 JSON：${error.message}`))
+      }
+    })
+  })
+
+  /** 发一段 JSON。 */
+  const sendJson = (res, code, payload) => {
+    const body = JSON.stringify(payload)
+    res.writeHead(code, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-length': Buffer.byteLength(body),
+    })
+    res.end(body)
+  }
+
+  /* ── 开关 ── */
+  const stateHandler = async (req, res) => {
+    const method = String(req.method || 'GET').toUpperCase()
+    try {
+      if (!isTrustedWrite(req)) {
+        sendJson(res, 403, { ok: false, error: 'cross-site request rejected' })
+        return
+      }
+      if (method === 'GET' || method === 'HEAD') {
+        sendJson(res, 200, { ok: true, enabled, seq })
+        return
+      }
+      if (method !== 'PUT' && method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      const body = await readJsonBody(req)
+      if (typeof body.enabled === 'boolean') {
+        const was = enabled
+        enabled = body.enabled
+        // 刚打开时把旧账清掉：不然重开一次铃铛会连弹昨天攒下的一串。
+        if (enabled && !was) pending.length = 0
+        note(`enabled = ${enabled}`)
+      }
+      sendJson(res, 200, { ok: true, enabled, seq })
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: String((error && error.message) || error) })
+    }
+  }
+
+  /* ── 补偿拉取 ── */
+  const pendingHandler = async (req, res) => {
+    if (String(req.method || 'GET').toUpperCase() !== 'GET') {
+      sendJson(res, 405, { ok: false, error: 'method not allowed' })
+      return
+    }
+    const url = new URL(req.url || '/', 'http://localhost')
+    const sinceRaw = Number(url.searchParams.get('since'))
+    const since = Number.isFinite(sinceRaw) ? sinceRaw : 0
+    // since 落在缓冲区之前（断线太久）就只给现有的，客户端按最大 seq 继续。
+    const events = pending.filter((item) => item.seq > since)
+    sendJson(res, 200, { ok: true, seq, events })
+  }
+
+  /* ── 手动测试 ── */
+  const testHandler = async (req, res) => {
+    if (String(req.method || 'GET').toUpperCase() !== 'POST') {
+      sendJson(res, 405, { ok: false, error: 'method not allowed' })
+      return
+    }
+    try {
+      if (!isTrustedWrite(req)) {
+        sendJson(res, 403, { ok: false, error: 'cross-site request rejected' })
+        return
+      }
+      const delivered = await deliver(TITLE_DEFAULT, BODY_TEST)
+      note(`test toast: ${delivered || 'failed'}`)
+      sendJson(res, 200, { ok: true, delivered })
+    } catch (error) {
+      sendJson(res, 400, { ok: false, error: String((error && error.message) || error) })
+    }
+  }
+
+  /* ── SSE 长连接 ── */
+  const streamHandler = async (req, res) => {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      // 关掉 Nginx 一类反代对 SSE 的缓冲，否则事件会被攒住不发。
+      'x-accel-buffering': 'no',
+    })
+    // 立刻回一段注释帧：让 EventSource 的 onopen 尽快触发，也顺便证明链路是通的。
+    res.write(': connected\n\n')
+    streams.add(res)
+
+    const timer = setInterval(() => {
+      try {
+        res.write(': ping\n\n')
+      } catch {
+        clearInterval(timer)
+        streams.delete(res)
+      }
+    }, HEARTBEAT_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+
+    const cleanup = () => {
+      clearInterval(timer)
+      streams.delete(res)
+    }
+    req.on('close', cleanup)
+    req.on('error', cleanup)
+    res.on('close', cleanup)
+    res.on('error', cleanup)
+  }
+
+  mount(() => {
+    const fiber = ctx.inject(['webServer'], (child) => {
+      const disposers = []
+      const add = (route, handler, label) => {
+        try {
+          disposers.push(child.webServer.register({ kind: 'exact', path: route, handler }))
+          note(`route registered: ${label} ${route}`)
+        } catch (error) {
+          // HMR 重入会抛 duplicate exact route；旧 handler 功能等价，记一笔就够。
+          note(`route registration failed: ${label} ${route}: ${String((error && error.message) || error)}`)
+        }
+      }
+      add(ROUTE_STATE, stateHandler, 'state')
+      add(ROUTE_PENDING, pendingHandler, 'pending')
+      add(ROUTE_STREAM, streamHandler, 'stream')
+      add(ROUTE_TEST, testHandler, 'test')
+      return () => {
+        for (const dispose of disposers.splice(0)) {
+          try {
+            dispose()
+          } catch {
+            /* 已经卸掉就算了 */
+          }
+        }
+        for (const res of streams) {
+          try {
+            res.end()
+          } catch {
+            /* 同上 */
+          }
+        }
+        streams.clear()
+      }
+    })
+
+    return () => {
+      try {
+        void fiber.dispose()
+      } catch {
+        /* 同上 */
+      }
+    }
+  }, 'dsh-bell-notify: routes')
+}
+
+/** 通知标题。 */
+const TITLE_DEFAULT = '任务完成'
+/** 拿不到会话标题时的正文。 */
+const BODY_FALLBACK = '模型跑完了一个任务'
+/** 测试通知的正文。 */
+const BODY_TEST = '这是一条测试通知 —— 铃铛工作正常'
+
+export {
+  BODY_FALLBACK,
+  BODY_TEST,
+  MAX_PENDING,
+  ROUTE_PENDING,
+  ROUTE_STATE,
+  ROUTE_STREAM,
+  ROUTE_TEST,
+  TITLE_DEFAULT,
+}

@@ -1,0 +1,50 @@
+{
+  "name": "dsh-bell-notify",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "侧栏左下角（账户旁边）的铃铛：打开后，模型每次跑完任务就发一条系统通知。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "notification",
+    "bell",
+    "notify"
+  ],
+  "license": "MIT",
+  "author": "HitMargin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HitMargin/dsh-bell-notify.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

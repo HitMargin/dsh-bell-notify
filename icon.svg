@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="任务完成提醒">
+  <rect width="64" height="64" rx="14" fill="none"/>
+  <g fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M46 27a14 14 0 0 0-28 0c0 16-6.5 20-6.5 20h41S46 43 46 27"/>
+    <path d="M37.5 51a6 6 0 0 1-11 0"/>
+  </g>
+</svg>

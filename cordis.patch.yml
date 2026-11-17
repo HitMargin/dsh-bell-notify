@@ -1,0 +1,5 @@
+# bundle 层：把插件行插进装配树。
+- insert:
+    - id: bell-notify
+      name: 'dsh-bell-notify'
+      config: {}
