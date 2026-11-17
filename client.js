@@ -201,18 +201,21 @@ window.__ModuleLoader__.load({
           if (!Array.isArray(events) || events.length === 0) return
           for (const item of events) {
             if (!item || typeof item.seq !== 'number') continue
-            const title = typeof item.title === 'string' && item.title.trim().length > 0
-              ? item.title.trim()
-              : t('notifyBody')
+            // 兜底通知的正文：模型输出优先，标题只是"哪个会话"而非"说了什么"。
+            const body = typeof item.body === 'string' && item.body.trim().length > 0
+              ? item.body.trim()
+              : (typeof item.title === 'string' && item.title.trim().length > 0
+                ? item.title.trim()
+                : t('notifyBody'))
 
             if (item.seq > lastSeq.current) {
               lastSeq.current = item.seq
               flashDot()
               // delivered 由宿主给：'pending' 时系统通知还在发，等后续同 seq 的更新帧。
-              if (item.delivered === 'failed') fallbackNotify(title)
+              if (item.delivered === 'failed') fallbackNotify(body)
             } else if (item.seq === lastSeq.current) {
               // 同一 seq 的后续帧：只是补发通知通道的结果，不重复亮点。
-              if (item.delivered === 'failed') fallbackNotify(title)
+              if (item.delivered === 'failed') fallbackNotify(body)
             }
           }
         }, [flashDot, t])

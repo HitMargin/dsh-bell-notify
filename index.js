@@ -227,6 +227,88 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * 取会话标题。
+   *
+   * 先看 `api-session/added` 缓存（免费），没有再问 `sessionQuery.readTitle`
+   * （权威但要走一次查询）。缓存只覆盖本次进程启动后新增的会话，所以不能只靠它。
+   *
+   * @param {string} sessionId 会话 id。
+   * @returns {Promise<string>} 标题；取不到时空串。
+   */
+  const titleOf = async (sessionId) => {
+    const cached = titles.get(sessionId)
+    if (typeof cached === 'string' && cached.trim().length > 0) return cached.trim()
+
+    const query = typeof ctx.get === 'function' ? ctx.get('sessionQuery') : null
+    if (!query || typeof query.readTitle !== 'function') return ''
+    try {
+      const snapshot = await query.readTitle(sessionId)
+      return snapshot && typeof snapshot.title === 'string' ? snapshot.title.trim() : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * 取模型这一轮最后输出的文本。
+   *
+   * `readSurface` 返回"当前模型表层"——按模型历史顺序排列的事件，其中
+   * `assistant/message` 的 `message.content` 里 `type === 'text'` 的块就是模型说的话。
+   * 从后往前找第一条**非空**的，因为一轮可能以工具调用收尾（最后一条是 `tool/result`）。
+   *
+   * 两个防御：
+   * - **超时**：官方 README 明说 `readSurface` 会回放并校验整个日志，大历史一次调用可能好几秒。
+   *   通知不该为此卡住，超时（或出错）就退化成通用文案 —— 铃该响还是得响。
+   * - **截断**：往系统通知里塞一整篇回答没有意义，超过 180 字就截断加省略号。
+   *
+   * @param {string} sessionId 会话 id。
+   * @param {number} timeoutMs 上限。
+   * @returns {Promise<string>} 模型输出；取不到时空串。
+   */
+  const lastAssistantText = async (sessionId, timeoutMs = 4000) => {
+    const query = typeof ctx.get === 'function' ? ctx.get('sessionQuery') : null
+    if (!query || typeof query.readSurface !== 'function') return ''
+
+    const read = (async () => {
+      const surface = await query.readSurface(sessionId)
+      const events = Array.isArray(surface?.events) ? surface.events : []
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const event = events[i]
+        if (!event || event.type !== 'assistant/message') continue
+        const blocks = Array.isArray(event.message?.content) ? event.message.content : []
+        const text = blocks
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text)
+          .join('\n')
+          .trim()
+        if (text.length > 0) return text
+      }
+      return ''
+    })()
+
+    // 手写超时而不是 AbortSignal：readSurface 不接受 signal，Promise.race 是唯一
+    // 能给它设上限的办法。超时后那次读仍在后台跑完，但不影响本次通知。
+    let timer
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(''), timeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+    })
+
+    try {
+      return await Promise.race([read.catch(() => ''), timeout])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** 压平空白并截断，给通知正文用。 */
+  const summarize = (text, limit = 180) => {
+    const flat = String(text || '').replace(/\s+/g, ' ').trim()
+    if (flat.length <= limit) return flat
+    return `${flat.slice(0, limit)}…`
+  }
+
   mount(() => {
     const offStatus = ctx.on('api-session/status', (sessionId, isRunning) => {
       if (isRunning) {
@@ -241,7 +323,9 @@ export function apply(ctx) {
       const event = {
         seq,
         sessionId,
+        // 先占位，标题与正文在后台补齐后同一条事件再推一次。
         title: titles.get(sessionId) || '',
+        body: '',
         // 先标 pending 就推：客户端立刻能亮红点，不必等系统通知发完。
         // PowerShell 兜底最坏要 4 秒，把它挡在事件前面会让提示明显迟滞。
         delivered: 'pending',
@@ -250,17 +334,30 @@ export function apply(ctx) {
       while (pending.length > MAX_PENDING) pending.shift()
       broadcast(event)
 
-      // 通知在后台发，结果补进同一条事件再推一次。
+      // 后台补齐标题与模型输出，再发通知；结果回填同一条事件后推第二次。
       // 客户端按 seq 认更新，所以同一 seq 出现两次是设计内的。
-      void deliver(TITLE_DEFAULT, event.title || BODY_FALLBACK)
-        .then((how) => {
-          event.delivered = how || 'failed'
-          broadcast(event)
-          if (!how) note(`toast failed for ${sessionId}`)
-        })
-        .catch(() => {
+      void (async () => {
+        const [title, body] = await Promise.all([
+          titleOf(sessionId),
+          lastAssistantText(sessionId),
+        ])
+        event.title = title
+        event.body = summarize(body)
+
+        // 标题是通知的第一行，正文是第二行 —— 也就是"哪个会话"+"模型说了什么"。
+        // 两者都拿不到时才退回通用文案，绝不让通知变成空白。
+        const heading = title || TITLE_DEFAULT
+        const content = event.body || BODY_FALLBACK
+
+        const how = await deliver(heading, content)
+        event.delivered = how || 'failed'
+        broadcast(event)
+        if (!how) note(`toast failed for ${sessionId}`)
+      })()
+        .catch((error) => {
           event.delivered = 'failed'
           broadcast(event)
+          note(`notify pipeline failed for ${sessionId}: ${String((error && error.message) || error)}`)
         })
     })
 
