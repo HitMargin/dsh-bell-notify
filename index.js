@@ -274,8 +274,18 @@ export function apply(ctx) {
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const event = events[i]
       if (!event || event.type !== 'assistant/message') continue
-      if (event.interrupted === true) continue
-      const content = Array.isArray(event.message?.content) ? event.message.content : []
+      /*
+       * 事件体在 data 里。SessionEvent 的真实形状是
+       *   { type, seq, time, data: SessionEventMap[type] }
+       * 所以 assistant/message 的字段在 event.data.message，不是 event.message。
+       *
+       * 这里曾经写的是 event.message，永远取到 undefined，于是正文恒为空、
+       * 每次都退回通用文案 —— 而测试 fixture 也照着错的结构写，所以测试全绿、线上全废。
+       * 保留内联兜底，避免以后结构再变又静默失效。
+       */
+      const data = event.data && typeof event.data === 'object' ? event.data : event
+      if (data.interrupted === true) continue
+      const content = Array.isArray(data.message?.content) ? data.message.content : []
       const text = content
         .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
         .map((b) => b.text)

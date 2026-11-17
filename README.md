@@ -23,6 +23,20 @@
 
 正文超过 180 字会截断加省略号：系统通知里塞一整篇回答没有意义。
 
+### 事件结构是 `{ type, seq, time, data }`
+
+读表层事件时最容易踩的坑：消息**不在事件顶层**，而在 `data` 里。
+
+```
+{ type: 'assistant/message', seq, time,
+  data: { turn, step, message: { role, content: [...] }, stream, interrupted? } }
+```
+
+我第一版写的是 `event.message?.content`，永远取到 `undefined`，于是正文恒为空、
+每次都退回通用文案「模型跑完了一个任务」——而当时测试 fixture 也把字段内联在顶层，
+**测试全绿、线上全废**。现在 fixture 按真实结构生成，并加了一条守卫断言
+`event.message === undefined`，防止再犯。
+
 ### 为什么正文可能不是"结论"（以及怎么治）
 
 这一版之前，正文取的是"`readSurface()` 里最后一条 `assistant/message` 的文本"，看起来天经地义，

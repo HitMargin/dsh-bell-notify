@@ -16,18 +16,24 @@ const { apply, ROUTE_PENDING, ROUTE_STATE } = await import('../index.js');
 
 const ok = (msg) => console.log('ok   ' + msg);
 
-/** 造一条 assistant 文本事件。 */
-const assistant = (text) => ({
+/**
+ * 造一条 assistant 文本事件。
+ *
+ * 形状必须和真实事件一致：`{ type, seq, time, data }`，消息在 `data` 里
+ * （见 dsh-session 的 `SessionEvent<T>`）。之前 fixture 把字段内联在顶层，
+ * 结果实现里写错 `event.message` 也照样全绿 —— 测试证明了错误的行为。
+ */
+const assistant = (text, extra = {}) => ({
   type: 'assistant/message',
-  turn: 1,
-  step: 1,
-  message: { role: 'assistant', content: [{ type: 'text', text }] },
+  seq: 1,
+  time: 0,
+  data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] }, ...extra },
 });
 const toolResult = () => ({
   type: 'tool/result',
-  turn: 1,
-  step: 1,
-  message: { role: 'tool', content: [{ type: 'text', text: 'ok' }] },
+  seq: 2,
+  time: 0,
+  data: { turn: 1, step: 1, message: { role: 'tool', content: [{ type: 'text', text: 'ok' }] } },
 });
 
 /**
@@ -119,6 +125,17 @@ async function waitSettled(routes, timeoutMs = 3000) {
   return (await pendingEvents(routes)).pop();
 }
 
+/* ── 0. 守卫：fixture 必须是真实事件形状 ────────────────────────────── */
+{
+  // 真实 SessionEvent = { type, seq, time, data }，消息在 data 里。
+  // 这条守卫是上次事故的产物：fixture 把字段内联在顶层，实现里写错
+  // event.message 也照样全绿，线上却永远退回通用文案。
+  const e = assistant('x');
+  assert.equal(e.message, undefined, 'fixture 不该把 message 内联在顶层');
+  assert.ok(e.data && e.data.message, 'message 应在 data 里');
+  ok('fixture 形状与真实 SessionEvent 一致（消息在 data 里）');
+}
+
 /* ── 1. 最后一轮有文本：标题 = 会话标题，正文 = 模型输出 ───────────── */
 {
   const h = await makeHost({
@@ -158,15 +175,19 @@ async function waitSettled(routes, timeoutMs = 3000) {
     title: '多段输出',
     surface: [{
       type: 'assistant/message',
-      turn: 1,
-      step: 1,
-      message: {
-        role: 'assistant',
-        content: [
-          { type: 'text', text: '第一段。' },
-          { type: 'tool_use', id: 't1', name: 'x', input: {} },
-          { type: 'text', text: '第二段。' },
-        ],
+      seq: 1,
+      time: 0,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '第一段。' },
+            { type: 'tool_use', id: 't1', name: 'x', input: {} },
+            { type: 'text', text: '第二段。' },
+          ],
+        },
       },
     }],
   });
@@ -253,18 +274,21 @@ async function waitSettled(routes, timeoutMs = 3000) {
 {
   const h = await makeHost({
     title: '被中断',
-    surface: [{
+    surface: [
+    assistant('我先看一下'),
+    // interrupted 在 data 里（与真实 SessionEvent 一致），不是事件顶层。
+    {
       type: 'assistant/message',
-      turn: 1,
-      step: 1,
-      message: { role: 'assistant', content: [{ type: 'text', text: '我先看一下' }] },
-    }, {
-      type: 'assistant/message',
-      turn: 1,
-      step: 2,
-      interrupted: true,
-      message: { role: 'assistant', content: [{ type: 'text', text: '那么我改' }] },
-    }],
+      seq: 2,
+      time: 0,
+      data: {
+        turn: 1,
+        step: 2,
+        interrupted: true,
+        message: { role: 'assistant', content: [{ type: 'text', text: '那么我改' }] },
+      },
+    },
+  ],
   });
   h.emit('s-1', true);
   h.emit('s-1', false);
