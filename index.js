@@ -250,56 +250,103 @@ export function apply(ctx) {
     }
   }
 
+  /** 手写 sleep。宿主定时器服务未必注入，而且这里只需要一个短延迟。 */
+  const delay = (ms) => new Promise((resolve) => {
+    const t = setTimeout(resolve, ms)
+    if (typeof t.unref === 'function') t.unref()
+  })
+
   /**
-   * 取模型这一轮最后输出的文本。
+   * 从表层事件里挑"结论那一条"：从后往前，第一条**未被中断**且有正文的
+   * `assistant/message`。
    *
-   * `readSurface` 返回"当前模型表层"——按模型历史顺序排列的事件，其中
-   * `assistant/message` 的 `message.content` 里 `type === 'text'` 的块就是模型说的话。
-   * 从后往前找第一条**非空**的，因为一轮可能以工具调用收尾（最后一条是 `tool/result`）。
+   * 为什么跳过 `interrupted: true`：那是回合被中途打断时落下的**残片**，
+     * 文本往往是半句话，拿它当结论只会误导。
    *
-   * 两个防御：
-   * - **超时**：官方 README 明说 `readSurface` 会回放并校验整个日志，大历史一次调用可能好几秒。
-   *   通知不该为此卡住，超时（或出错）就退化成通用文案 —— 铃该响还是得响。
-   * - **截断**：往系统通知里塞一整篇回答没有意义，超过 180 字就截断加省略号。
+   * 为什么不再"优先不含工具调用的那条"：一轮若以工具调用收尾（被打断、撞到上限），
+     * 那条助手消息的正文确实是过场话；但更早的纯文本同样是过场话，而且更旧。
+     * 与其替用户猜一个陈旧的结论，不如如实呈现"模型最后说了什么" —— 没有结论就是没有结论。
    *
-   * @param {string} sessionId 会话 id。
-   * @param {number} timeoutMs 上限。
-   * @returns {Promise<string>} 模型输出；取不到时空串。
+   * @param {object[]} events 表层事件。
+   * @returns {string} 结论文本；没有就空串。
    */
-  const lastAssistantText = async (sessionId, timeoutMs = 4000) => {
+  const pickConclusion = (events) => {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]
+      if (!event || event.type !== 'assistant/message') continue
+      if (event.interrupted === true) continue
+      const content = Array.isArray(event.message?.content) ? event.message.content : []
+      const text = content
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('\n')
+        .trim()
+      if (text.length > 0) return text
+    }
+    return ''
+  }
+
+  /**
+   * 取模型这一轮输出的结论。
+   *
+   * `readSurface` 返回"当前模型表层"——按模型历史顺序排列的事件。
+     *
+   * 这里不是"读一次就完事"，而是**带重试地读到稳定为止**，因为有两个真实的失败模式：
+   *
+   * 1. **读早了**。`api-session/status` 在 agent 转 idle 时触发，而最后一条
+   *    `assistant/message` 未必已经落进表层。这时候读到的是上一轮的中间文本 ——
+     *    表现出来就是"弹窗内容不是模型的输出结论"。
+   * 2. **读失败**。官方 README 明说 `readSurface` 要回放并校验整个日志，大历史可能好几秒；
+     *    它不接受 `AbortSignal`，一旦卡住就只能靠超时。旧实现读失败时静默退到通用文案，
+   *    用户看到的就是"模型跑完了一个任务"，而不是真正的结论。
+     *
+   * 策略：在宽限期内多读几遍，**取事件数最多的那一份** —— 后读到的包含更完整的历史，
+   * 说明这一轮的收尾消息已经落表。不能用"最后一条是不是 assistant/message"来判断：
+   * 中途快照同样以 assistant/message 结尾，两者分不开（这一点是测试逼出来的）。
+     * 宽限期过后仍未拿到文本，就用手头最好的那份 —— 通知宁可带一份稍旧的结论，也不能不发。
+     *
+     * @param {string} sessionId 会话 id。
+     * @returns {Promise<string>} 结论文本；取不到时空串。
+     */
+  const lastAssistantText = async (sessionId) => {
     const query = typeof ctx.get === 'function' ? ctx.get('sessionQuery') : null
     if (!query || typeof query.readSurface !== 'function') return ''
 
-    const read = (async () => {
-      const surface = await query.readSurface(sessionId)
-      const events = Array.isArray(surface?.events) ? surface.events : []
-      for (let i = events.length - 1; i >= 0; i -= 1) {
-        const event = events[i]
-        if (!event || event.type !== 'assistant/message') continue
-        const blocks = Array.isArray(event.message?.content) ? event.message.content : []
-        const text = blocks
-          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-          .map((b) => b.text)
-          .join('\n')
-          .trim()
-        if (text.length > 0) return text
+    const TOTAL_MS = 4000      // 总预算：通知不该为读日志无限期等待
+    const ATTEMPT_MS = 1200    // 单次尝试上限：卡住的 readSurface 不能拖死轮询
+    const POLL_MS = 150
+    const GRACE_MS = 900       // 宽限期：在这段时间内多读几遍，取"最新"的那份
+
+    const deadline = Date.now() + TOTAL_MS
+    const graceEnd = Date.now() + GRACE_MS
+    let best = { text: '', size: -1 }
+
+    while (Date.now() < deadline) {
+      // 单次尝试也要有上限：否则一次永不返回的 readSurface 会把整个循环卡死。
+      let attempt = null
+      try {
+        attempt = await Promise.race([
+          query.readSurface(sessionId).catch(() => null),
+          delay(ATTEMPT_MS).then(() => null),
+        ])
+      } catch {
+        attempt = null
       }
-      return ''
-    })()
 
-    // 手写超时而不是 AbortSignal：readSurface 不接受 signal，Promise.race 是唯一
-    // 能给它设上限的办法。超时后那次读仍在后台跑完，但不影响本次通知。
-    let timer
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve(''), timeoutMs)
-      if (typeof timer.unref === 'function') timer.unref()
-    })
+      if (attempt) {
+        const events = Array.isArray(attempt.events) ? attempt.events : []
+        const text = pickConclusion(events)
+        // 取"事件更多"的那一份：后读到的包含更完整的历史，说明这一轮的收尾消息
+        // 已经落进表层。用"最后一条是不是 assistant/message"来判断是不够的 ——
+        // 中途快照同样以 assistant/message 结尾，两者分不开。
+        if (text.length > 0 && events.length > best.size) best = { text, size: events.length }
+      }
 
-    try {
-      return await Promise.race([read.catch(() => ''), timeout])
-    } finally {
-      clearTimeout(timer)
+      if (Date.now() >= graceEnd || Date.now() >= deadline) break
+      await delay(POLL_MS)
     }
+
+    return best.text
   }
 
   /** 压平空白并截断，给通知正文用。 */

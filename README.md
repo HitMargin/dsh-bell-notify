@@ -18,17 +18,33 @@
 ```
 
 标题取自会话标题（先看 `api-session/added` 缓存，没有再问 `sessionQuery.readTitle`），
-正文取 `readSurface()` 返回的模型表层里**最后一条非空**的 `assistant/message` 文本——
-之所以是"最后一条非空"，因为一轮可能以工具调用收尾，最后一条事件是 `tool/result` 而不是助手消息。
+正文取 `readSurface()` 返回的模型表层里**最后一条未被中断**的 `assistant/message` 文本
+（跳过 `interrupted: true` 的残片——那是回合被打断时的半句话）。
 
 正文超过 180 字会截断加省略号：系统通知里塞一整篇回答没有意义。
 
-### 取不到正文时
+### 为什么正文可能不是"结论"（以及怎么治）
 
-`readSurface` 会回放并校验整个日志，官方 README 明说大历史一次调用可能好几秒。所以它带 4 秒超时，
-超时或出错就只用通用文案「模型跑完了一个任务」——**铃该响还是得响**，不会因为取正文失败而卡住或静默。
+这一版之前，正文取的是"`readSurface()` 里最后一条 `assistant/message` 的文本"，看起来天经地义，
+实际有两个坑：
 
-`test/content.test.mjs` 里有一条专门测这个：让 `readSurface` 永不返回，断言通知照发。
+**① 读早了。** `api-session/status` 在 agent 转 idle 时触发，而最后一条 `assistant/message`
+未必已经落进表层。这时读到的是**上一轮的中间文本**——表现出来就是"弹窗内容不是模型的输出结论"。
+
+**② 读失败被静默吞掉。** 官方 README 明说 `readSurface` 要回放并校验整个日志，大历史可能好几秒，
+而它不接受 `AbortSignal`。旧实现读失败就退到通用文案，用户看到的是"模型跑完了一个任务"。
+
+现在的做法：
+
+- **在 900ms 宽限期内多读几遍，取事件数最多的那一份**。后读到的历史更完整，说明这一轮的收尾消息
+  已经落表。用"最后一条是不是 assistant/message"来判断是不行的——**中途快照同样以它结尾**，
+  两者分不开（这一点是被测试逼出来的，我最初的写法就栽在这里）。
+- **单次读取有 1.2 秒上限**，一次永不返回的 `readSurface` 不会拖死整个轮询。
+- **跳过 `interrupted: true` 的消息**：那是回合被打断时落下的残片，文本往往是半句话。
+- 宽限期后仍拿不到，就用手头最好的那份——通知宁可带一份稍旧的结论，也不能不发。
+
+`test/content.test.mjs` 里第 8、9 条专门钉这两点：让前两次读到上一轮文本、第三次才出现结论，
+断言最终取到的是结论；再让最后一条带 `interrupted`，断言不会拿它当结论。
 
 ## 用法
 
@@ -99,7 +115,7 @@ SSE 由网络驱动，不受定时器节流影响。`EventSource` 断线会自�
 node --check index.js && node --check client.js
 node test/smoke.mjs         # 客户端：模块外壳、slot 注册、开关两种渲染
 node test/host.test.mjs     # 宿主：转场判定、四条路由、开关、since 游标、跨站拦截
-node test/content.test.mjs  # 通知内容：标题=会话标题、正文=模型输出、截断、超时
+node test/content.test.mjs  # 通知内容：标题=会话标题、正文=模型结论、读早了要重试、残片跳过、截断
 node test/toast-live.mjs    # 手动：真的弹一条通知（会出现在屏幕上）
 ```
 

@@ -220,7 +220,61 @@ async function waitSettled(routes, timeoutMs = 3000) {
   ok(`readSurface 卡住 → 超时后通知照发（delivered=${ev.delivered}）`);
 }
 
-/* ── 7. readSurface 抛错 → 同样不影响通知 ────────────────────────── */
+/* ── 8. 读早了：先只拿到上一轮文本，收尾后才出现结论 ─────────────── */
+{
+  // 前两次读到的是"上一轮的中间文本"，第三次才是这一轮的结论。
+  // 这正是"弹窗内容不是模型输出结论"的成因：状态刚变 idle 时最后一条消息还没落进表层。
+  let calls = 0;
+  const h = await makeHost({
+    title: '读早了',
+    surface: () => {
+      calls += 1;
+      if (calls < 3) {
+        return {
+          session: { id: 's-1' }, inheritedEventCount: 0, capturedThroughSeq: 1,
+          events: [assistant('我来看一下现有实现。')],
+        };
+      }
+      return {
+        session: { id: 's-1' }, inheritedEventCount: 0, capturedThroughSeq: 3,
+        events: [assistant('我来看一下现有实现。'), assistant('结论：抽成独立函数并补了测试。')],
+      };
+    },
+  });
+  h.emit('s-1', true);
+  h.emit('s-1', false);
+
+  const ev = await waitSettled(h.routes, 6000);
+  assert.equal(ev.body, '结论：抽成独立函数并补了测试。', '应等到这一轮收尾后的结论，而不是上一轮的中间文本');
+  ok('读早了 → 重试到收尾，拿到的是这一轮的结论');
+}
+
+/* ── 9. 被打断的残片不能当结论 ────────────────────────────────────── */
+{
+  const h = await makeHost({
+    title: '被中断',
+    surface: [{
+      type: 'assistant/message',
+      turn: 1,
+      step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: '我先看一下' }] },
+    }, {
+      type: 'assistant/message',
+      turn: 1,
+      step: 2,
+      interrupted: true,
+      message: { role: 'assistant', content: [{ type: 'text', text: '那么我改' }] },
+    }],
+  });
+  h.emit('s-1', true);
+  h.emit('s-1', false);
+
+  const ev = await waitSettled(h.routes, 6000);
+  assert.equal(ev.body, '我先看一下', '被中断那条是残片，应回退到上一条完整文本');
+  ok('被打断的残片被跳过，不回退成半句话');
+}
+
+/* ── 10. readSurface 抛错 → 同样不影响通知 ────────────────────────── */
 {
   const h = await makeHost({
     title: '报错会话',
